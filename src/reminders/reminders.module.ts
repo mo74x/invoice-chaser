@@ -8,6 +8,7 @@ import { REMINDERS_QUEUE } from './reminders.constants';
 import { StripeModule } from '../stripe/stripe.module';
 import { InvoicesModule } from '../invoices/invoices.module';
 import { MailModule } from '../mail/mail.module';
+import { AiModule } from '../ai/ai.module';
 
 @Module({
   imports: [
@@ -17,6 +18,7 @@ import { MailModule } from '../mail/mail.module';
     forwardRef(() => StripeModule),
     InvoicesModule,
     MailModule,
+    AiModule
   ],
   controllers: [RemindersController],
   providers: [RemindersService, SchedulerService, RemindersProcessor],

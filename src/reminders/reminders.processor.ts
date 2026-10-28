@@ -1,15 +1,14 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Logger } from '@nestjs/common';
 import { Job } from 'bullmq';
-import { InvoiceStatus, ReminderStatus } from '../../generated/prisma/enums';
+import { InvoiceStatus, ReminderStatus } from "../../generated/prisma/client";
 import { PrismaService } from '../prisma/prisma.service';
 import { StripeService } from '../stripe/stripe.service';
 import { InvoicesService } from '../invoices/invoices.service';
 import { MailService } from '../mail/mail.service';
-import {
-  formatMinorUnits,
-  renderFallbackTemplate,
-} from '../mail/mail.templates';
+import { formatMinorUnits } from '../mail/mail.templates';
+import { AiService } from '../ai/ai.service';
+import { ToneProfile } from '../ai/interfaces/tone-profile.interface';
 import { SchedulerService } from './scheduler.service';
 import { REMINDERS_QUEUE } from './reminders.constants';
 
@@ -28,13 +27,14 @@ export class RemindersProcessor extends WorkerHost {
     private readonly stripeService: StripeService,
     private readonly invoicesService: InvoicesService,
     private readonly mailService: MailService,
+    private readonly aiService: AiService,
     private readonly schedulerService: SchedulerService,
   ) {
     super();
   }
 
   async process(job: Job<ReminderJobData>): Promise<void> {
-    const { reminderId, invoiceId, stage } = job.data;
+    const { reminderId, stage } = job.data;
 
     const reminder = await this.prisma.reminder.findUnique({
       where: { id: reminderId },
@@ -103,7 +103,6 @@ export class RemindersProcessor extends WorkerHost {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error';
-      // If local DB already knows it's not OPEN, cancel immediately
       if (invoice.status !== InvoiceStatus.OPEN) {
         await this.schedulerService.cancelForInvoice(
           invoice.id,
@@ -114,7 +113,7 @@ export class RemindersProcessor extends WorkerHost {
       this.logger.error(
         `Live Stripe fetch failed for ${invoice.stripeInvoiceId}: ${message}`,
       );
-      throw err; // Trigger BullMQ retry with backoff
+      throw err;
     }
 
     // 4. Per-customer daily cap (max 1 reminder per customer per day across invoices)
@@ -126,7 +125,7 @@ export class RemindersProcessor extends WorkerHost {
         invoice: {
           accountId: account.id,
           customerEmail: invoice.customerEmail,
-          id: { not: invoice.id }, // Allow distinct stages of same invoice during fast local testing
+          id: { not: invoice.id },
         },
       },
     });
@@ -145,7 +144,7 @@ export class RemindersProcessor extends WorkerHost {
       return;
     }
 
-    // 5. Build templated email (Phase 3 will plug Claude Tone Engine in here with fallback)
+    // 5. Generate Tone-Matched Email via AiService (with validation, retry & fallback)
     const customerFirstName =
       invoice.customerName?.trim().split(/\s+/)[0] ?? '';
     const formattedAmount = formatMinorUnits(
@@ -167,13 +166,17 @@ export class RemindersProcessor extends WorkerHost {
       invoice.customerEmail,
     );
 
-    const rendered = renderFallbackTemplate(stage, {
-      customerFirstName,
-      invoiceNumber,
-      formattedAmount,
-      formattedDueDate,
-      payLink,
-      senderName: account.senderName,
+    const rendered = await this.aiService.generateReminderEmail({
+      stage,
+      toneProfile: (account.toneProfile as ToneProfile | null) ?? null,
+      facts: {
+        customer_first_name: customerFirstName,
+        invoice_number: invoiceNumber,
+        amount: formattedAmount,
+        due_date: formattedDueDate,
+        pay_link: payLink,
+        sender_name: account.senderName,
+      },
       unsubscribeUrl,
     });
 
@@ -188,7 +191,7 @@ export class RemindersProcessor extends WorkerHost {
         },
       });
       this.logger.log(
-        `Reminder ${reminder.id} (stage ${stage}) moved to PENDING_APPROVAL`,
+        `Reminder ${reminder.id} (stage ${stage}, usedFallback=${rendered.usedFallback}) moved to PENDING_APPROVAL`,
       );
       return;
     }
@@ -217,7 +220,7 @@ export class RemindersProcessor extends WorkerHost {
     });
 
     this.logger.log(
-      `Sent stage ${stage} reminder for invoice ${invoice.stripeInvoiceId} to ${invoice.customerEmail} (resendEmailId=${resendEmailId})`,
+      `Sent stage ${stage} reminder for invoice ${invoice.stripeInvoiceId} to ${invoice.customerEmail} (resendEmailId=${resendEmailId}, usedFallback=${rendered.usedFallback})`,
     );
   }
 }

@@ -8,6 +8,8 @@ import { InvoicesModule } from './invoices/invoices.module';
 import { StripeModule } from './stripe/stripe.module';
 import { MailModule } from './mail/mail.module';
 import { RemindersModule } from './reminders/reminders.module';
+import { AiModule } from './ai/ai.module';
+import { ToneModule } from './tone/tone.module';
 
 @Module({
   imports: [
@@ -35,6 +37,8 @@ import { RemindersModule } from './reminders/reminders.module';
     StripeModule,
     MailModule,
     RemindersModule,
+    AiModule,
+    ToneModule,
   ],
 })
 export class AppModule {}
