@@ -1,0 +1,113 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Account {
+  id                String        @id @default(uuid())
+  email             String        @unique
+  stripeAccountId   String?       @unique
+  stripeTokenEnc    String?       // AES-256-GCM encrypted access token
+  senderName        String
+  senderEmail       String
+  timezone          String        @default("UTC")
+  approvalMode      Boolean       @default(false)
+  toneProfile       Json?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  invoices          Invoice[]
+  toneSamples       ToneSample[]
+  suppressions      Suppression[]
+}
+
+model Invoice {
+  id               String        @id @default(uuid())
+  accountId        String
+  stripeInvoiceId  String        @unique
+  invoiceNumber    String?
+  customerEmail    String
+  customerName     String?
+  amountDue        Int           // Minor units (e.g., cents)
+  currency         String
+  dueDate          DateTime
+  status           InvoiceStatus
+  hostedInvoiceUrl String?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  account          Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  reminders        Reminder[]
+
+  @@index([accountId, status])
+  @@index([accountId, customerEmail])
+}
+
+enum InvoiceStatus {
+  OPEN
+  PAID
+  VOID
+  UNCOLLECTIBLE
+}
+
+model Reminder {
+  id            String         @id @default(uuid())
+  invoiceId     String
+  stage         Int            // 3, 7, 14
+  scheduledFor  DateTime
+  status        ReminderStatus
+  resendEmailId String?        @unique
+  subject       String?
+  body          String?
+  failureReason String?
+  sentAt        DateTime?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  invoice       Invoice        @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@unique([invoiceId, stage])
+  @@index([status, scheduledFor])
+}
+
+enum ReminderStatus {
+  SCHEDULED
+  PENDING_APPROVAL
+  SENT
+  SKIPPED
+  FAILED
+}
+
+model WebhookEvent {
+  id          String    @id @default(uuid())
+  source      String    // "stripe" | "resend"
+  externalId  String    @unique
+  type        String
+  payload     Json?
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([source, type])
+}
+
+model ToneSample {
+  id        String   @id @default(uuid())
+  accountId String
+  content   String
+  createdAt DateTime @default(now())
+  account   Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId])
+}
+
+model Suppression {
+  id        String   @id @default(uuid())
+  accountId String
+  email     String
+  reason    String   // "unsubscribed" | "bounced" | "complained"
+  createdAt DateTime @default(now())
+  account   Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, email])
+}
