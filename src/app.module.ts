@@ -12,6 +12,7 @@ import { RemindersModule } from './reminders/reminders.module';
 import { AiModule } from './ai/ai.module';
 import { ToneModule } from './tone/tone.module';
 import { SettingsModule } from './settings/settings.module';
+import { DashboardModule } from './dashboard/dashboard.module';
 
 @Module({
   imports: [
@@ -43,6 +44,7 @@ import { SettingsModule } from './settings/settings.module';
     ToneModule,
     ObservabilityModule,
     SettingsModule,
+    DashboardModule,
   ],
 })
 export class AppModule {}

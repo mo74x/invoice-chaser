@@ -129,12 +129,46 @@ export class StripeService {
   }
 
   /**
-   * Used in Phase 2+ by the Reminder Worker to re-check live status from Stripe before sending.
+   * Used by the Reminder Worker to re-check live status from Stripe before sending.
+   * Supports synthetic load-test invoices (in_loadtest_*) or sk_test_mock for 10k k6 runs.
    */
   async fetchLiveInvoice(
     stripeInvoiceId: string,
     stripeAccountId?: string | null,
   ): Promise<Stripe.Invoice> {
+    const secretKey = this.configService.get<string>('STRIPE_SECRET_KEY', '');
+    if (
+      secretKey === 'sk_test_mock' ||
+      stripeInvoiceId.startsWith('in_loadtest_')
+    ) {
+      const local = await this.prisma.invoice.findUnique({
+        where: { stripeInvoiceId },
+      });
+      const statusMap: Record<string, Stripe.Invoice.Status> = {
+        OPEN: 'open',
+        PAID: 'paid',
+        VOID: 'void',
+        UNCOLLECTIBLE: 'uncollectible',
+      };
+      return {
+        id: stripeInvoiceId,
+        object: 'invoice',
+        status: local ? statusMap[local.status] : 'open',
+        customer_email: local?.customerEmail ?? 'loadtest@example.com',
+        customer_name: local?.customerName ?? 'Load Test User',
+        amount_due: local?.amountDue ?? 15000,
+        currency: local?.currency ?? 'usd',
+        due_date: local
+          ? Math.floor(local.dueDate.getTime() / 1000)
+          : Math.floor(Date.now() / 1000),
+        created: Math.floor(Date.now() / 1000),
+        number: local?.invoiceNumber ?? stripeInvoiceId,
+        hosted_invoice_url:
+          local?.hostedInvoiceUrl ??
+          `https://invoice.stripe.com/i/loadtest/${stripeInvoiceId}`,
+      } as unknown as Stripe.Invoice;
+    }
+
     if (stripeAccountId) {
       return this.stripe.invoices.retrieve(
         stripeInvoiceId,
