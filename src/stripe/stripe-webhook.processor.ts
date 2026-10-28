@@ -4,7 +4,9 @@ import { Job } from 'bullmq';
 import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
 import { InvoicesService } from '../invoices/invoices.service';
+import { SchedulerService } from '../reminders/scheduler.service';
 import { STRIPE_EVENTS_QUEUE } from './stripe.constants';
+import { InvoiceStatus } from '../../generated/prisma/enums';
 
 interface StripeEventJobData {
   eventId: string;
@@ -17,6 +19,7 @@ export class StripeWebhookProcessor extends WorkerHost {
   constructor(
     private readonly prisma: PrismaService,
     private readonly invoicesService: InvoicesService,
+    private readonly schedulerService: SchedulerService,
   ) {
     super();
   }
@@ -43,11 +46,10 @@ export class StripeWebhookProcessor extends WorkerHost {
       return;
     }
 
-    // Resolve the founder Account that owns this Stripe event
     const stripeAccountId = event.account;
     const account = stripeAccountId
       ? await this.prisma.account.findUnique({ where: { stripeAccountId } })
-      : await this.prisma.account.findFirst(); // Fallback for local Stripe CLI test mode
+      : await this.prisma.account.findFirst();
 
     if (!account) {
       this.logger.warn(
@@ -65,6 +67,18 @@ export class StripeWebhookProcessor extends WorkerHost {
       this.logger.log(
         `Synced invoice ${invoice.stripeInvoiceId} status=${invoice.status} (openTransition=${transitionedToOpen}, terminalTransition=${transitionedToTerminal})`,
       );
+
+      if (invoice.status === InvoiceStatus.OPEN) {
+        await this.schedulerService.scheduleForInvoice(
+          invoice,
+          account.timezone,
+        );
+      } else {
+        await this.schedulerService.cancelForInvoice(
+          invoice.id,
+          `Stripe event ${event.type}: invoice status is ${invoice.status}`,
+        );
+      }
     }
 
     await this.markProcessed(eventId);

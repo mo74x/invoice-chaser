@@ -6,6 +6,8 @@ import { PrismaModule } from './prisma/prisma.module';
 import { CryptoModule } from './common/crypto/crypto.module';
 import { InvoicesModule } from './invoices/invoices.module';
 import { StripeModule } from './stripe/stripe.module';
+import { MailModule } from './mail/mail.module';
+import { RemindersModule } from './reminders/reminders.module';
 
 @Module({
   imports: [
@@ -31,6 +33,8 @@ import { StripeModule } from './stripe/stripe.module';
     CryptoModule,
     InvoicesModule,
     StripeModule,
+    MailModule,
+    RemindersModule,
   ],
 })
 export class AppModule {}
