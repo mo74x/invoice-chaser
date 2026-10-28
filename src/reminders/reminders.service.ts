@@ -21,7 +21,7 @@ export class RemindersService {
     private readonly invoicesService: InvoicesService,
     private readonly mailService: MailService,
     private readonly schedulerService: SchedulerService,
-  ) {}
+  ) { }
 
   async listPending(accountId: string) {
     return this.prisma.reminder.findMany({
@@ -90,6 +90,7 @@ export class RemindersService {
     const bodyText = reminder.body ?? '';
 
     const { resendEmailId } = await this.mailService.sendReminderEmail({
+      reminderId: reminder.id,
       accountId: account.id,
       senderName: account.senderName,
       senderEmail: account.senderEmail,

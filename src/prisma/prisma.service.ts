@@ -6,6 +6,9 @@ export class PrismaService
   extends PrismaClient
   implements OnModuleInit, OnModuleDestroy
 {
+  [x: string]: any;
+  [x: string]: any;
+  reminderAudit: any;
   async onModuleInit(): Promise<void> {
     await this.$connect();
   }

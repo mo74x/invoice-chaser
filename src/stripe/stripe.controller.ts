@@ -4,6 +4,7 @@ import { Queue } from 'bullmq';
 import { Request } from 'express';
 import { Prisma } from '../../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { MetricsService } from '../observability/metrics.service';
 import { StripeService } from './stripe.service';
 import {
   STRIPE_EVENTS_QUEUE,
@@ -17,6 +18,7 @@ export class StripeController {
   constructor(
     private readonly stripeService: StripeService,
     private readonly prisma: PrismaService,
+    private readonly metricsService: MetricsService,
     @InjectQueue(STRIPE_EVENTS_QUEUE)
     private readonly stripeEventsQueue: Queue,
   ) {}
@@ -47,24 +49,25 @@ export class StripeController {
     @common.Req() req: common.RawBodyRequest<Request>,
     @common.Headers('stripe-signature') signature: string,
   ): Promise<{ received: boolean; duplicate?: boolean }> {
-    if (!signature) {
-      throw new common.BadRequestException('Missing stripe-signature header');
-    }
-    if (!req.rawBody) {
-      throw new common.BadRequestException('Missing raw request body');
+    const stopTimer = this.metricsService.webhookLatency.startTimer({
+      source: 'stripe',
+    });
+
+    if (!signature || !req.rawBody) {
+      stopTimer({ event_type: 'unknown', status: '400' });
+      throw new common.BadRequestException('Missing stripe-signature or raw body');
     }
 
-    // 1. Cryptographically verify signature using raw Buffer
     const event = this.stripeService.constructWebhookEvent(
       req.rawBody,
       signature,
     );
 
     if (!SUPPORTED_STRIPE_EVENTS.has(event.type)) {
+      stopTimer({ event_type: event.type, status: '200' });
       return { received: true };
     }
 
-    // 2. Idempotent insert into webhook_events
     try {
       await this.prisma.webhookEvent.create({
         data: {
@@ -75,29 +78,30 @@ export class StripeController {
         },
       });
     } catch (err) {
-      // P2002 = Unique constraint violation on externalId (already received)
       if (
         err instanceof Prisma.PrismaClientKnownRequestError &&
         err.code === 'P2002'
       ) {
+        stopTimer({ event_type: event.type, status: '200_duplicate' });
         this.logger.debug(`Duplicate Stripe webhook ${event.id} ignored`);
         return { received: true, duplicate: true };
       }
+      stopTimer({ event_type: event.type, status: '500' });
       throw err;
     }
 
-    // 3. Enqueue background processing with deterministic jobId
     await this.stripeEventsQueue.add(
       event.type,
       { eventId: event.id },
       {
-        jobId: `stripe-event:${event.id}`,
+        jobId: `stripe-event-${event.id}`,
         attempts: 5,
         backoff: { type: 'exponential', delay: 2000 },
         removeOnComplete: true,
       },
     );
 
+    stopTimer({ event_type: event.type, status: '200' });
     return { received: true };
   }
 }

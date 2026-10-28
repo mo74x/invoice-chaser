@@ -1,21 +1,48 @@
-import {
-  Controller,
-  Get,
-  Post,
-  Param,
-  HttpCode,
-  HttpStatus,
-  Header,
-} from '@nestjs/common';
+import * as common from '@nestjs/common';
+import { Request } from 'express';
 import { MailService } from './mail.service';
+import { MetricsService } from '../observability/metrics.service';
 
-@Controller('unsubscribe')
+@common.Controller()
 export class MailController {
-  constructor(private readonly mailService: MailService) {}
+  constructor(
+    private readonly mailService: MailService,
+    private readonly metricsService: MetricsService,
+  ) {}
 
-  @Get(':token')
-  @Header('Content-Type', 'text/html; charset=utf-8')
-  async unsubscribePage(@Param('token') token: string): Promise<string> {
+  @common.Post('webhooks/resend')
+  @common.HttpCode(common.HttpStatus.OK)
+  async handleResendWebhook(
+    @common.Req() req: common.RawBodyRequest<Request>,
+    @common.Headers('svix-id') svixId: string,
+    @common.Headers('svix-timestamp') svixTimestamp: string,
+    @common.Headers('svix-signature') svixSignature: string,
+  ) {
+    const stopTimer = this.metricsService.webhookLatency.startTimer({
+      source: 'resend',
+    });
+
+    if (!req.rawBody) {
+      stopTimer({ event_type: 'unknown', status: '400' });
+      throw new common.BadRequestException('Missing raw request body');
+    }
+
+    const payload = this.mailService.verifyResendWebhookSignature(
+      req.rawBody,
+      svixId,
+      svixTimestamp,
+      svixSignature,
+    );
+
+    const result = await this.mailService.processResendWebhook(svixId, payload);
+    stopTimer({ event_type: payload.type, status: '200' });
+
+    return result;
+  }
+
+  @common.Get('unsubscribe/:token')
+  @common.Header('Content-Type', 'text/html; charset=utf-8')
+  async unsubscribePage(@common.Param('token') token: string): Promise<string> {
     const { email } = await this.mailService.handleUnsubscribe(token);
     return `
 <!DOCTYPE html>
@@ -39,9 +66,9 @@ export class MailController {
 </html>`.trim();
   }
 
-  @Post(':token')
-  @HttpCode(HttpStatus.OK)
-  async unsubscribeOneClick(@Param('token') token: string) {
+  @common.Post('unsubscribe/:token')
+  @common.HttpCode(common.HttpStatus.OK)
+  async unsubscribeOneClick(@common.Param('token') token: string) {
     const { email } = await this.mailService.handleUnsubscribe(token);
     return { unsubscribed: true, email };
   }

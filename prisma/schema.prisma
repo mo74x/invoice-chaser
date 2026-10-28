@@ -24,6 +24,13 @@ model Account {
   suppressions      Suppression[]
 }
 
+enum DeliveryStatus {
+  NONE
+  DELIVERED
+  BOUNCED
+  COMPLAINED
+}
+
 model Invoice {
   id               String        @id @default(uuid())
   accountId        String
@@ -53,22 +60,39 @@ enum InvoiceStatus {
 }
 
 model Reminder {
-  id            String         @id @default(uuid())
-  invoiceId     String
-  stage         Int            // 3, 7, 14
-  scheduledFor  DateTime
-  status        ReminderStatus
-  resendEmailId String?        @unique
-  subject       String?
-  body          String?
-  failureReason String?
-  sentAt        DateTime?
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
-  invoice       Invoice        @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  id             String          @id @default(uuid())
+  invoiceId      String
+  stage          Int             // 3, 7, 14
+  scheduledFor   DateTime
+  status         ReminderStatus
+  deliveryStatus DeliveryStatus  @default(NONE)
+  resendEmailId  String?         @unique
+  subject        String?
+  body           String?
+  failureReason  String?
+  sentAt         DateTime?
+  deliveredAt    DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  invoice        Invoice         @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  audits         ReminderAudit[]
 
   @@unique([invoiceId, stage])
   @@index([status, scheduledFor])
+}
+model ReminderAudit {
+  id         String   @id @default(uuid())
+  reminderId String
+  accountId  String
+  invoiceId  String
+  stage      Int
+  event      String   // e.g. "SCHEDULED" | "LIVE_CHECK_PASSED" | "AI_FALLBACK" | "SENT" | "DELIVERED" | "BOUNCED" | "COMPLAINED" | "FAILED_DLQ"
+  metadata   Json?
+  createdAt  DateTime @default(now())
+  reminder   Reminder @relation(fields: [reminderId], references: [id], onDelete: Cascade)
+
+  @@index([reminderId, createdAt])
+  @@index([accountId, invoiceId])
 }
 
 enum ReminderStatus {

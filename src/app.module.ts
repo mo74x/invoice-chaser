@@ -4,12 +4,14 @@ import { BullModule } from '@nestjs/bullmq';
 import { LoggerModule } from 'nestjs-pino';
 import { PrismaModule } from './prisma/prisma.module';
 import { CryptoModule } from './common/crypto/crypto.module';
+import { ObservabilityModule } from './observability/observability.module';
 import { InvoicesModule } from './invoices/invoices.module';
 import { StripeModule } from './stripe/stripe.module';
 import { MailModule } from './mail/mail.module';
 import { RemindersModule } from './reminders/reminders.module';
 import { AiModule } from './ai/ai.module';
 import { ToneModule } from './tone/tone.module';
+import { SettingsModule } from './settings/settings.module';
 
 @Module({
   imports: [
@@ -39,6 +41,8 @@ import { ToneModule } from './tone/tone.module';
     RemindersModule,
     AiModule,
     ToneModule,
+    ObservabilityModule,
+    SettingsModule,
   ],
 })
 export class AppModule {}

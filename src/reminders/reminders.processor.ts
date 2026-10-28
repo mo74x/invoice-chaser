@@ -1,7 +1,12 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
+import {
+  Processor,
+  WorkerHost,
+  OnWorkerEvent,
+  InjectQueue,
+} from '@nestjs/bullmq';
 import { Logger } from '@nestjs/common';
-import { Job } from 'bullmq';
-import { InvoiceStatus, ReminderStatus } from "../../generated/prisma/client";
+import { Job, Queue } from 'bullmq';
+import { InvoiceStatus, ReminderStatus } from '../../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { StripeService } from '../stripe/stripe.service';
 import { InvoicesService } from '../invoices/invoices.service';
@@ -9,8 +14,14 @@ import { MailService } from '../mail/mail.service';
 import { formatMinorUnits } from '../mail/mail.templates';
 import { AiService } from '../ai/ai.service';
 import { ToneProfile } from '../ai/interfaces/tone-profile.interface';
+import { MetricsService } from '../observability/metrics.service';
+import { AlertService } from '../observability/alert.service';
+import { AuditService } from '../observability/audit.service';
 import { SchedulerService } from './scheduler.service';
-import { REMINDERS_QUEUE } from './reminders.constants';
+import {
+  REMINDERS_QUEUE,
+  REMINDERS_DLQ_QUEUE,
+} from './reminders.constants';
 
 export interface ReminderJobData {
   reminderId: string;
@@ -18,7 +29,15 @@ export interface ReminderJobData {
   stage: number;
 }
 
-@Processor(REMINDERS_QUEUE)
+@Processor(REMINDERS_QUEUE, {
+  concurrency: 5,
+  limiter: {
+    max: 10,
+    duration: 1000,
+  },
+  lockDuration: 30000,
+  maxStalledCount: 2,
+})
 export class RemindersProcessor extends WorkerHost {
   private readonly logger = new Logger(RemindersProcessor.name);
 
@@ -29,6 +48,10 @@ export class RemindersProcessor extends WorkerHost {
     private readonly mailService: MailService,
     private readonly aiService: AiService,
     private readonly schedulerService: SchedulerService,
+    private readonly metricsService: MetricsService,
+    private readonly alertService: AlertService,
+    private readonly auditService: AuditService,
+    @InjectQueue(REMINDERS_DLQ_QUEUE) private readonly dlqQueue: Queue,
   ) {
     super();
   }
@@ -71,6 +94,17 @@ export class RemindersProcessor extends WorkerHost {
         invoice.id,
         'Customer email is on suppression list',
       );
+      this.metricsService.remindersTotal.inc({
+        status: 'skipped',
+        stage: String(stage),
+      });
+      await this.auditService.log({
+        reminderId: reminder.id,
+        accountId: account.id,
+        invoiceId: invoice.id,
+        stage,
+        event: 'SKIPPED_SUPPRESSED',
+      });
       return;
     }
 
@@ -92,16 +126,35 @@ export class RemindersProcessor extends WorkerHost {
         this.invoicesService.mapStripeStatus(liveStripeInvoice.status);
 
       if (liveStatus !== InvoiceStatus.OPEN) {
-        this.logger.log(
-          `Race condition prevented: Live Stripe status for ${invoice.stripeInvoiceId} is ${liveStatus}. Cancelling reminders.`,
-        );
         await this.schedulerService.cancelForInvoice(
           invoice.id,
           `Live Stripe re-check returned status ${liveStatus}`,
         );
+        this.metricsService.remindersTotal.inc({
+          status: 'skipped',
+          stage: String(stage),
+        });
+        await this.auditService.log({
+          reminderId: reminder.id,
+          accountId: account.id,
+          invoiceId: invoice.id,
+          stage,
+          event: 'SKIPPED_ALREADY_PAID_OR_CLOSED',
+          metadata: { liveStatus },
+        });
         return;
       }
+
+      await this.auditService.log({
+        reminderId: reminder.id,
+        accountId: account.id,
+        invoiceId: invoice.id,
+        stage,
+        event: 'LIVE_CHECK_PASSED',
+        metadata: { stripeInvoiceId: invoice.stripeInvoiceId },
+      });
     } catch (err) {
+      this.metricsService.externalErrorsTotal.inc({ provider: 'stripe' });
       const message = err instanceof Error ? err.message : 'Unknown error';
       if (invoice.status !== InvoiceStatus.OPEN) {
         await this.schedulerService.cancelForInvoice(
@@ -111,6 +164,12 @@ export class RemindersProcessor extends WorkerHost {
         return;
       }
       this.logger.error(
+        {
+          accountId: account.id,
+          invoiceId: invoice.id,
+          stage,
+          error: message,
+        },
         `Live Stripe fetch failed for ${invoice.stripeInvoiceId}: ${message}`,
       );
       throw err;
@@ -131,9 +190,6 @@ export class RemindersProcessor extends WorkerHost {
     });
 
     if (recentSentCount > 0) {
-      this.logger.log(
-        `Daily customer cap reached for ${invoice.customerEmail}; skipping stage ${stage} for invoice ${invoice.stripeInvoiceId}`,
-      );
       await this.prisma.reminder.update({
         where: { id: reminder.id },
         data: {
@@ -141,10 +197,26 @@ export class RemindersProcessor extends WorkerHost {
           failureReason: 'Max 1 reminder per customer per day across invoices',
         },
       });
+      this.metricsService.remindersTotal.inc({
+        status: 'skipped',
+        stage: String(stage),
+      });
+      await this.auditService.log({
+        reminderId: reminder.id,
+        accountId: account.id,
+        invoiceId: invoice.id,
+        stage,
+        event: 'SKIPPED_DAILY_CAP',
+      });
       return;
     }
 
-    // 5. Generate Tone-Matched Email via AiService (with validation, retry & fallback)
+    // 5. Generate Tone-Matched Email (or reuse already-generated draft if worker is retrying after a Resend timeout)
+    const unsubscribeUrl = this.mailService.generateUnsubscribeUrl(
+      account.id,
+      invoice.customerEmail,
+    );
+
     const customerFirstName =
       invoice.customerName?.trim().split(/\s+/)[0] ?? '';
     const formattedAmount = formatMinorUnits(
@@ -161,10 +233,6 @@ export class RemindersProcessor extends WorkerHost {
     const payLink =
       invoice.hostedInvoiceUrl ??
       `${process.env.APP_URL ?? 'http://localhost:3000'}/invoices/${invoice.id}`;
-    const unsubscribeUrl = this.mailService.generateUnsubscribeUrl(
-      account.id,
-      invoice.customerEmail,
-    );
 
     const rendered = await this.aiService.generateReminderEmail({
       stage,
@@ -180,24 +248,53 @@ export class RemindersProcessor extends WorkerHost {
       unsubscribeUrl,
     });
 
-    // 6. If account is in Approval Mode, store draft and pause at PENDING_APPROVAL
+    if (rendered.validationErrors && rendered.validationErrors.length > 0) {
+      this.metricsService.aiValidationFailuresTotal.inc({
+        stage: String(stage),
+        attempt: String(rendered.attempts),
+      });
+    }
+
+    // Persist generated subject & body BEFORE calling Resend so audit state is durable
+    await this.prisma.reminder.update({
+      where: { id: reminder.id },
+      data: {
+        subject: rendered.subject,
+        body: rendered.text,
+      },
+    });
+
+    await this.auditService.log({
+      reminderId: reminder.id,
+      accountId: account.id,
+      invoiceId: invoice.id,
+      stage,
+      event: rendered.usedFallback ? 'AI_FALLBACK_TEMPLATE' : 'AI_GENERATED',
+      metadata: {
+        attempts: rendered.attempts,
+        usedFallback: rendered.usedFallback,
+      },
+    });
+
+    // 6. Approval mode check
     if (account.approvalMode) {
       await this.prisma.reminder.update({
         where: { id: reminder.id },
-        data: {
-          status: ReminderStatus.PENDING_APPROVAL,
-          subject: rendered.subject,
-          body: rendered.text,
-        },
+        data: { status: ReminderStatus.PENDING_APPROVAL },
       });
-      this.logger.log(
-        `Reminder ${reminder.id} (stage ${stage}, usedFallback=${rendered.usedFallback}) moved to PENDING_APPROVAL`,
-      );
+      await this.auditService.log({
+        reminderId: reminder.id,
+        accountId: account.id,
+        invoiceId: invoice.id,
+        stage,
+        event: 'PENDING_APPROVAL',
+      });
       return;
     }
 
-    // 7. Send via Resend and record result
+    // 7. Crash-safe idempotent send via Resend (uses Idempotency-Key: reminder-send-${reminder.id})
     const { resendEmailId } = await this.mailService.sendReminderEmail({
+      reminderId: reminder.id,
       accountId: account.id,
       senderName: account.senderName,
       senderEmail: account.senderEmail,
@@ -213,14 +310,114 @@ export class RemindersProcessor extends WorkerHost {
       data: {
         status: ReminderStatus.SENT,
         resendEmailId,
-        subject: rendered.subject,
-        body: rendered.text,
         sentAt: new Date(),
+        failureReason: null,
       },
     });
 
-    this.logger.log(
-      `Sent stage ${stage} reminder for invoice ${invoice.stripeInvoiceId} to ${invoice.customerEmail} (resendEmailId=${resendEmailId}, usedFallback=${rendered.usedFallback})`,
+    this.metricsService.remindersTotal.inc({
+      status: 'sent',
+      stage: String(stage),
+    });
+
+    await this.auditService.log({
+      reminderId: reminder.id,
+      accountId: account.id,
+      invoiceId: invoice.id,
+      stage,
+      event: 'SENT',
+      metadata: { resendEmailId },
+    });
+  }
+
+  /**
+   * Dead-Letter Queue (DLQ) handler:
+   * Invoked when a job attempt fails. Once all retries are exhausted, moves the job to
+   * REMINDERS_DLQ_QUEUE, marks the database row FAILED, records an audit event, and fires an alert.
+   */
+  @OnWorkerEvent('failed')
+  async onJobFailed(
+    job: Job<ReminderJobData> | undefined,
+    error: Error,
+  ): Promise<void> {
+    if (!job) return;
+
+    const maxAttempts = job.opts.attempts ?? 3;
+    if (job.attemptsMade < maxAttempts) {
+      this.logger.warn(
+        {
+          reminderId: job.data.reminderId,
+          invoiceId: job.data.invoiceId,
+          stage: job.data.stage,
+          attempt: job.attemptsMade,
+          maxAttempts,
+        },
+        `Reminder job ${job.id} failed attempt ${job.attemptsMade}/${maxAttempts}: ${error.message}`,
+      );
+      return;
+    }
+
+    // Retries exhausted -> Move to Dead-Letter Queue
+    const { reminderId, invoiceId, stage } = job.data;
+
+    const reminder = await this.prisma.reminder.findUnique({
+      where: { id: reminderId },
+      include: { invoice: true },
+    });
+
+    const accountId = reminder?.invoice.accountId ?? 'unknown';
+
+    if (reminder && reminder.status !== ReminderStatus.SENT) {
+      await this.prisma.reminder.update({
+        where: { id: reminderId },
+        data: {
+          status: ReminderStatus.FAILED,
+          failureReason: `Exhausted ${maxAttempts} attempts: ${error.message}`,
+        },
+      });
+
+      await this.auditService.log({
+        reminderId,
+        accountId,
+        invoiceId,
+        stage,
+        event: 'FAILED_DLQ',
+        metadata: {
+          attemptsMade: job.attemptsMade,
+          error: error.message,
+        },
+      });
+    }
+
+    await this.dlqQueue.add(
+      'dead-letter-reminder',
+      {
+        originalJobId: job.id,
+        reminderId,
+        invoiceId,
+        accountId,
+        stage,
+        failedReason: error.message,
+        failedAt: new Date().toISOString(),
+      },
+      {
+        jobId: `dlq-${reminderId}`,
+        removeOnComplete: false,
+      },
     );
+
+    this.metricsService.remindersTotal.inc({
+      status: 'failed',
+      stage: String(stage),
+    });
+
+    await this.alertService.triggerAlert({
+      severity: 'CRITICAL',
+      title: 'Reminder job moved to Dead-Letter Queue (DLQ)',
+      accountId,
+      invoiceId,
+      stage,
+      reason: error.message,
+    });
   }
 }

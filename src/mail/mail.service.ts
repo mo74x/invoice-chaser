@@ -5,12 +5,15 @@ import {
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { DeliveryStatus, Prisma, ReminderStatus } from '../../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { ReminderStatus } from '../../generated/prisma/client'
-import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
+import { MetricsService } from '../observability/metrics.service';
+import { AuditService } from '../observability/audit.service';
+import { createHmac, timingSafeEqual } from 'crypto';
 import { Resend } from 'resend';
 
 export interface SendReminderEmailParams {
+  reminderId: string;
   accountId: string;
   senderName: string;
   senderEmail: string;
@@ -21,6 +24,17 @@ export interface SendReminderEmailParams {
   unsubscribeUrl: string;
 }
 
+export interface ResendWebhookPayload {
+  type: 'email.sent' | 'email.delivered' | 'email.bounced' | 'email.complained';
+  created_at: string;
+  data: {
+    email_id: string;
+    to: string[];
+    from: string;
+    subject?: string;
+  };
+}
+
 @Injectable()
 export class MailService {
   private readonly logger = new Logger(MailService.name);
@@ -29,10 +43,13 @@ export class MailService {
   private readonly fromDomain: string;
   private readonly appUrl: string;
   private readonly secretKey: string;
+  private readonly resendWebhookSecret: string;
 
   constructor(
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
+    private readonly metricsService: MetricsService,
+    private readonly auditService: AuditService,
   ) {
     const apiKey = this.configService.get<string>('RESEND_API_KEY', 're_mock');
     this.isMockMode = !apiKey || apiKey === 're_mock';
@@ -43,12 +60,12 @@ export class MailService {
     );
     this.appUrl = this.configService.getOrThrow<string>('APP_URL');
     this.secretKey = this.configService.getOrThrow<string>('ENCRYPTION_KEY');
+    this.resendWebhookSecret = this.configService.get<string>(
+      'RESEND_WEBHOOK_SECRET',
+      'whsec_test_resend_secret',
+    );
   }
 
-  /**
-   * Checks whether an email address is on the account's suppression list
-   * (unsubscribed, bounced, or complained).
-   */
   async isSuppressed(accountId: string, email: string): Promise<boolean> {
     const normalizedEmail = email.toLowerCase().trim();
     const record = await this.prisma.suppression.findUnique({
@@ -62,9 +79,6 @@ export class MailService {
     return Boolean(record);
   }
 
-  /**
-   * Generates a tamper-proof, stateless URL-safe unsubscribe token for (accountId, email).
-   */
   generateUnsubscribeUrl(accountId: string, email: string): string {
     const normalizedEmail = email.toLowerCase().trim();
     const data = JSON.stringify({ a: accountId, e: normalizedEmail });
@@ -111,25 +125,40 @@ export class MailService {
     }
   }
 
-  /**
-   * Adds the customer to the suppression list and immediately skips any pending reminders.
-   */
   async handleUnsubscribe(
     token: string,
   ): Promise<{ accountId: string; email: string }> {
     const { accountId, email } = this.verifyUnsubscribeToken(token);
+    await this.suppressAddressAndCancelReminders(
+      accountId,
+      email,
+      'unsubscribed',
+    );
+    return { accountId, email };
+  }
+
+  /**
+   * Adds an address to the account's Suppression table and skips all pending reminders
+   * for that customer across the account.
+   */
+  async suppressAddressAndCancelReminders(
+    accountId: string,
+    email: string,
+    reason: 'unsubscribed' | 'bounced' | 'complained',
+  ): Promise<void> {
+    const normalizedEmail = email.toLowerCase().trim();
 
     await this.prisma.$transaction([
       this.prisma.suppression.upsert({
         where: {
-          accountId_email: { accountId, email },
+          accountId_email: { accountId, email: normalizedEmail },
         },
         create: {
           accountId,
-          email,
-          reason: 'unsubscribed',
+          email: normalizedEmail,
+          reason,
         },
-        update: {},
+        update: { reason },
       }),
       this.prisma.reminder.updateMany({
         where: {
@@ -138,54 +167,70 @@ export class MailService {
           },
           invoice: {
             accountId,
-            customerEmail: email,
+            customerEmail: normalizedEmail,
           },
         },
         data: {
           status: ReminderStatus.SKIPPED,
-          failureReason: 'Customer unsubscribed',
+          failureReason: `Customer ${reason}`,
         },
       }),
     ]);
 
     this.logger.log(
-      `Suppressed customer ${email} for account ${accountId} (reason=unsubscribed)`,
+      { accountId, customerEmail: normalizedEmail, reason },
+      `Suppressed customer ${normalizedEmail} and skipped pending reminders (reason=${reason})`,
     );
-    return { accountId, email };
   }
 
   /**
-   * Sends a reminder email via Resend (or logs in mock mode) with Reply-To and RFC-8058 List-Unsubscribe headers.
+   * Sends a reminder email via Resend using a deterministic Idempotency-Key (`reminder-send-${reminderId}`).
+   * If a worker crashes after Resend accepts the request, retrying with the same reminderId
+   * returns the same email ID without sending a duplicate email.
    */
   async sendReminderEmail(
     params: SendReminderEmailParams,
   ): Promise<{ resendEmailId: string }> {
+    const idempotencyKey = `reminder-send-${params.reminderId}`;
     const fromAddress = this.fromDomain.includes('@')
       ? `${params.senderName} <${this.fromDomain}>`
       : `${params.senderName} <reminders@${this.fromDomain}>`;
 
     if (this.isMockMode || !this.resend) {
-      const mockId = `re_mock_${randomUUID()}`;
+      // Deterministic mock ID tied to reminderId so crash-retries are idempotent in mock mode too
+      const deterministicMockId = `re_mock_${params.reminderId}`;
       this.logger.log(
-        `[MOCK RESEND] Sent email (${mockId}) to=${params.toEmail} subject="${params.subject}"`,
+        {
+          accountId: params.accountId,
+          reminderId: params.reminderId,
+          resendEmailId: deterministicMockId,
+          idempotencyKey,
+        },
+        `[MOCK RESEND] Sent email (${deterministicMockId}) to=${params.toEmail} subject="${params.subject}"`,
       );
-      return { resendEmailId: mockId };
+      return { resendEmailId: deterministicMockId };
     }
 
-    const { data, error } = await this.resend.emails.send({
-      from: fromAddress,
-      to: [params.toEmail],
-      replyTo: params.senderEmail,
-      subject: params.subject,
-      text: params.text,
-      html: params.html,
-      headers: {
-        'List-Unsubscribe': `<${params.unsubscribeUrl}>`,
-        'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+    const { data, error } = await this.resend.emails.send(
+      {
+        from: fromAddress,
+        to: [params.toEmail],
+        replyTo: params.senderEmail,
+        subject: params.subject,
+        text: params.text,
+        html: params.html,
+        headers: {
+          'List-Unsubscribe': `<${params.unsubscribeUrl}>`,
+          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+        },
       },
-    });
+      {
+        idempotencyKey,
+      },
+    );
 
     if (error || !data?.id) {
+      this.metricsService.externalErrorsTotal.inc({ provider: 'resend' });
       this.logger.error(
         `Resend API error sending to ${params.toEmail}: ${error?.message ?? 'Unknown error'}`,
       );
@@ -195,5 +240,146 @@ export class MailService {
     }
 
     return { resendEmailId: data.id };
+  }
+
+  /**
+   * Verifies Svix HMAC signature for POST /webhooks/resend.
+   */
+  verifyResendWebhookSignature(
+    rawBody: Buffer,
+    svixId: string,
+    svixTimestamp: string,
+    svixSignature: string,
+  ): ResendWebhookPayload {
+    if (!svixId || !svixTimestamp || !svixSignature) {
+      throw new BadRequestException('Missing Svix webhook signature headers');
+    }
+
+    const rawSecret = this.resendWebhookSecret.startsWith('whsec_')
+      ? this.resendWebhookSecret.slice(6)
+      : this.resendWebhookSecret;
+
+    const secretBytes = Buffer.from(rawSecret, 'base64');
+    const signedContent = `${svixId}.${svixTimestamp}.${rawBody.toString('utf8')}`;
+    const expectedSignature = createHmac('sha256', secretBytes)
+      .update(signedContent)
+      .digest('base64');
+
+    const passedSignatures = svixSignature
+      .split(' ')
+      .map((part) => part.split(',')[1])
+      .filter((sig): sig is string => Boolean(sig));
+
+    const verified = passedSignatures.some((sig) => {
+      const a = Buffer.from(sig);
+      const b = Buffer.from(expectedSignature);
+      return a.length === b.length && timingSafeEqual(a, b);
+    });
+
+    if (!verified) {
+      throw new BadRequestException('Invalid Resend webhook signature');
+    }
+
+    return JSON.parse(rawBody.toString('utf8')) as ResendWebhookPayload;
+  }
+
+  /**
+   * Handles Resend delivery events (email.delivered, email.bounced, email.complained) idempotently.
+   */
+  async processResendWebhook(
+    svixId: string,
+    payload: ResendWebhookPayload,
+  ): Promise<{ processed: boolean; duplicate?: boolean }> {
+    try {
+      await this.prisma.webhookEvent.create({
+        data: {
+          source: 'resend',
+          externalId: svixId,
+          type: payload.type,
+          payload: payload as unknown as Prisma.InputJsonValue,
+          processedAt: new Date(),
+        },
+      });
+    } catch (err) {
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002'
+      ) {
+        return { processed: true, duplicate: true };
+      }
+      throw err;
+    }
+
+    const emailId = payload.data?.email_id;
+    if (!emailId) {
+      return { processed: true };
+    }
+
+    const reminder = await this.prisma.reminder.findUnique({
+      where: { resendEmailId: emailId },
+      include: { invoice: true },
+    });
+
+    if (!reminder) {
+      this.logger.debug(
+        `No reminder found matching resendEmailId=${emailId} for event ${payload.type}`,
+      );
+      return { processed: true };
+    }
+
+    const { invoice } = reminder;
+
+    if (payload.type === 'email.delivered') {
+      await this.prisma.reminder.update({
+        where: { id: reminder.id },
+        data: {
+          deliveryStatus: DeliveryStatus.DELIVERED,
+          deliveredAt: new Date(),
+        },
+      });
+      await this.auditService.log({
+        reminderId: reminder.id,
+        accountId: invoice.accountId,
+        invoiceId: invoice.id,
+        stage: reminder.stage,
+        event: 'DELIVERED',
+        metadata: { resendEmailId: emailId },
+      });
+    } else if (
+      payload.type === 'email.bounced' ||
+      payload.type === 'email.complained'
+    ) {
+      const reason =
+        payload.type === 'email.bounced' ? 'bounced' : 'complained';
+      const deliveryStatus =
+        payload.type === 'email.bounced'
+          ? DeliveryStatus.BOUNCED
+          : DeliveryStatus.COMPLAINED;
+
+      await this.prisma.reminder.update({
+        where: { id: reminder.id },
+        data: {
+          deliveryStatus,
+          failureReason: `Email ${reason} via Resend webhook`,
+        },
+      });
+
+      await this.suppressAddressAndCancelReminders(
+        invoice.accountId,
+        invoice.customerEmail,
+        reason,
+      );
+
+      await this.auditService.log({
+        reminderId: reminder.id,
+        accountId: invoice.accountId,
+        invoiceId: invoice.id,
+        stage: reminder.stage,
+        event: reason.toUpperCase(),
+        metadata: { resendEmailId: emailId },
+      });
+    }
+
+    return { processed: true };
   }
 }
