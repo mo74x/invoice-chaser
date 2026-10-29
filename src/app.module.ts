@@ -8,6 +8,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { CryptoModule } from './common/crypto/crypto.module';
 import { AuthModule } from './auth/auth.module';
 import { AuthGuard } from './auth/auth.guard';
+import { HealthModule } from './health/health.module';
 import { ObservabilityModule } from './observability/observability.module';
 import { InvoicesModule } from './invoices/invoices.module';
 import { StripeModule } from './stripe/stripe.module';
@@ -47,6 +48,7 @@ import { DashboardModule } from './dashboard/dashboard.module';
     PrismaModule,
     CryptoModule,
     AuthModule,
+    HealthModule,
     InvoicesModule,
     StripeModule,
     MailModule,

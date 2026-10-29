@@ -1,209 +1,163 @@
 # Invoice Chaser
 
-> **High-throughput, AI-powered invoice collection and automated reminder system built with NestJS, BullMQ, Redis, PostgreSQL (Prisma 7), Stripe Connect, Anthropic Claude, and Resend.**
+**Autonomous, AI-personalized invoice recovery and dunning engine for B2B SaaS.**
+
+Invoice Chaser connects to Stripe accounts via OAuth, listens to real-time invoice lifecycle webhooks, and orchestrates multi-stage overdue payment reminders (`STAGE_1` at Day 3, `STAGE_2` at Day 7, `STAGE_3` at Day 14, or custom per-account schedules). Instead of sending robotic templates, it learns each founder's writing voice from sample emails using Claude and generates context-aware, hallucination-checked follow-ups—backed by strict idempotency, distributed rate limiting, multi-tenant JWT authentication, and dead-letter queue recovery.
 
 ---
 
-## Executive Overview
-
-**Invoice Chaser** automates the entire late-invoice collection lifecycle for founders and finance teams:
-1. **Real-time Ingestion**: Securely ingests Stripe Connect invoice events (`invoice.finalized`, `invoice.paid`, `invoice.voided`, `invoice.marked_uncollectible`) with strict idempotency and out-of-order handling.
-2. **Deterministic 3-Stage Lifecycle**: Schedules staggered overdue reminders (+3 days, +7 days, +14 days) via BullMQ delayed jobs.
-3. **Never-Trust-Local-DB Guard**: Live re-checks Stripe invoice status before dispatching each email to guarantee zero reminders are sent for invoices settled seconds prior.
-4. **Claude Tone Engine**: Analyzes real founder emails to extract custom tone profiles (formality, greetings, sign-offs, humor, warmth). Generates human-like reminders matching the founder's voice with hallucination and adversarial safety validators.
-5. **Resend Delivery and Suppression**: Delivers emails with RFC List-Unsubscribe compliance, tracks delivery webhooks (`delivered`, `bounced`, `complained`), and automatically enforces account-level email suppressions.
-6. **Enterprise Observability**: Native Prometheus metrics (`/metrics`), Dead-Letter Queue (DLQ) routing, automated webhook alerts, audit logs, and founder KPI dashboards (`/dashboard/stats`).
-
----
-
-## Architecture and High-Level Visualization
+## System Architecture
 
 ```mermaid
-flowchart TD
-    subgraph External["External Platforms"]
-        Stripe["Stripe Connect Webhooks"]
-        Resend["Resend Webhooks (Svix HMAC)"]
+flowchart TB
+    subgraph External["External Providers & Clients"]
+        Stripe["Stripe API & Webhooks"]
         Claude["Anthropic Claude API"]
-        K6["k6 10k Load Testing"]
+        Resend["Resend Email & Svix Webhooks"]
+        Founder["Founder / Dashboard Client"]
+        K6["k6 Load Generator"]
     end
 
-    subgraph Ingestion["Ingestion & Webhooks"]
+    subgraph Security["Security & Edge Layer"]
+        Throttle["Rate Limiter (@nestjs/throttler)"]
+        AuthGuard["JWT AuthGuard & @CurrentUser()"]
+        MetricsGuard["MetricsGuard (Internal / Bearer Token)"]
+        ValPipe["Global ValidationPipe (Whitelist)"]
+    end
+
+    subgraph API["NestJS Ingestion & Control Plane"]
+        AuthCtrl["AuthController (/auth/magic-link, /auth/verify)"]
         StripeCtrl["StripeController (/webhooks/stripe)"]
-        ResendCtrl["MailController (/webhooks/resend)"]
-        Crypto["AES-256-GCM / Svix Verification"]
+        MailCtrl["MailController (/webhooks/resend, /webhooks/inbound-email, /unsubscribe)"]
+        RemCtrl["RemindersController (Approval Queue, Draft Edit, Pause/Resume)"]
+        ToneCtrl["ToneController & SettingsController"]
+        DashCtrl["DashboardController (/dashboard/overview, /dashboard/funnel)"]
+        ObsCtrl["ObservabilityController & HealthController (/metrics, /health)"]
     end
 
-    subgraph DataStorage["Persistence & State (PostgreSQL + Redis)"]
-        Prisma["Prisma ORM 7 + @prisma/adapter-pg"]
-        Postgres[(PostgreSQL 16)]
-        BullQueue["BullMQ Queue (reminders)"]
-        DLQueue["BullMQ DLQ (reminders-dlq)"]
-        Redis[(Redis 7)]
+    subgraph Storage["Persistence & Queue Layer"]
+        PG[("PostgreSQL 16 (Prisma 7 + @prisma/adapter-pg)")]
+        Redis[("Redis 7 (BullMQ + Rate Limits + Locks)")]
+        MainQ[["BullMQ: reminders queue"]]
+        DLQ[["BullMQ: reminders-dlq"]]
     end
 
-    subgraph Processing["Workers & Processing Engine"]
-        Worker["RemindersProcessor (WorkerHost)"]
-        LiveCheck["Live Stripe Status Re-check"]
-        AiEngine["AiService (Tone Matching + Guardrails)"]
-        Fallback["Template Fallback Engine"]
+    subgraph Worker["BullMQ Worker Pipeline (RemindersProcessor)"]
+        Gate1["1. Suppression & Unsubscribe Check"]
+        Gate2["2. Live Stripe Invoice Status Check"]
+        Gate3["3. Timezone Business-Hours Send Window"]
+        Gate4["4. AI Draft Generation & Hallucination Validator"]
+        Gate5["5. Approval Mode & Daily Send Cap Gate"]
+        Dispatch["6. Resend Email Dispatch & Audit Log"]
     end
 
-    subgraph DeliveryObservability["Delivery & Observability"]
-        MailService["MailService (Resend SDK)"]
-        Metrics["MetricsService (Prometheus /metrics)"]
-        Audits["AuditService & ReminderAudit Trail"]
-        Alerts["AlertService (External Webhooks)"]
-        Dashboard["DashboardService (/dashboard/stats)"]
-    end
+    Founder -->|"Magic Link Login & Bearer JWT"| Throttle
+    Throttle --> AuthGuard
+    AuthGuard --> ValPipe
+    ValPipe --> AuthCtrl
+    ValPipe --> RemCtrl
+    ValPipe --> ToneCtrl
+    ValPipe --> DashCtrl
 
-    %% Flow connections
-    Stripe -->|"Raw Payload + Stripe-Sig"| StripeCtrl
-    Resend -->|"Raw Payload + Svix Headers"| ResendCtrl
+    Stripe -->|"Signed Webhook (stripe-signature)"| StripeCtrl
     K6 -->|"Burst Webhooks (10k scale)"| StripeCtrl
+    Resend -->|"Delivery & Inbound Reply Webhooks (Svix)"| MailCtrl
 
-    StripeCtrl --> Crypto
-    ResendCtrl --> Crypto
-    StripeCtrl -->|"Idempotent Upsert"| Prisma
-    StripeCtrl -->|"Schedule 3d, 7d, 14d"| BullQueue
+    StripeCtrl -->|"Idempotent Upsert (WebhookEvent)"| PG
+    StripeCtrl -->|"Schedule Delayed Jobs"| MainQ
+    MainQ --- Redis
+    DLQ --- Redis
 
-    BullQueue --> Redis
-    Redis --> Worker
-    Worker --> LiveCheck
-    LiveCheck -->|"Verify not PAID/VOID"| Stripe
-    Worker -->|"If Tone Profile configured"| AiEngine
-    AiEngine -->|"Extract & Generate"| Claude
-    AiEngine -.->|"On Validation Error"| Fallback
-    Worker -->|"Send Email"| MailService
-    MailService --> Resend
-    Worker -->|"Max Retries Exhausted"| DLQueue
-    DLQueue --> Alerts
+    MainQ -->|"Concurrency: 10"| Gate1
+    Gate1 --> Gate2
+    Gate2 -->|"Live Fetch / Synthetic Mock"| Stripe
+    Gate2 --> Gate3
+    Gate3 --> Gate4
+    Gate4 -->|"Tone Profile + Prompt"| Claude
+    Gate4 --> Gate5
+    Gate5 --> Dispatch
+    Dispatch -->|"Send Email + Unsubscribe Headers"| Resend
+    Dispatch -->|"Write ReminderAudit"| PG
+    Dispatch -.->|"Exhausted Retries"| DLQ
 
-    Worker --> Audits
-    ResendCtrl -->|"Update DeliveryStatus & Suppressions"| Prisma
-    Metrics -->|"Gauges & Histograms"| Worker
-    Dashboard --> Prisma
-    Prisma --> Postgres
+    MailCtrl -->|"Bounce / Complaint / Reply Auto-Pause"| PG
+    ObsCtrl --- MetricsGuard
+    ObsCtrl -->|"Prometheus & DLQ Replay"| PG
+    ObsCtrl -->|"Queue Depth & Health"| Redis
 ```
 
 ---
 
-## End-to-End Reminder Lifecycle
+## Core Features
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Customer
-    participant Stripe as Stripe
-    participant Ingestion as Ingestion Service
-    participant Queue as BullMQ (Redis)
-    participant Worker as Reminders Worker
-    participant Claude as Claude Tone Engine
-    participant Resend as Resend Mail
-    participant DB as Postgres (Prisma)
+### 1. Security & Multi-Tenancy
+* **Zero-Trust Tenant Isolation**: Every protected controller derives `accountId` exclusively from the verified JWT payload (`@CurrentUser()`) enforced by a global `AuthGuard`. No endpoint trusts `accountId` from query parameters or request bodies.
+* **Magic-Link JWT Authentication**: Passwordless authentication flow via `POST /auth/magic-link` and `POST /auth/verify` issuing signed Bearer tokens.
+* **Protected Operational Endpoints**: `/metrics` and `/observability/*` are guarded by `MetricsGuard` (requiring `METRICS_TOKEN` or internal loopback access) so Prometheus metrics and DLQ replay triggers are never publicly exposed.
+* **Edge Rate Limiting & Strict DTO Validation**: Global `@nestjs/throttler` protection on public auth and unsubscribe routes, paired with a global `ValidationPipe` (`whitelist: true`, `forbidNonWhitelisted: true`, `transform: true`).
+* **AES-256-GCM Credential Encryption**: Connected Stripe OAuth tokens are encrypted at rest in PostgreSQL with an authenticated IV and auth tag, accompanied by a production key rotation runbook ([`docs/KEY_ROTATION.md`](docs/KEY_ROTATION.md)).
 
-    Stripe->>Ingestion: POST /webhooks/stripe (invoice.finalized)
-    Ingestion->>DB: Idempotently store WebhookEvent & Invoice (OPEN)
-    Ingestion->>Queue: Schedule delayed jobs (Stage 3, 7, 14 days)
-    Ingestion-->>Stripe: 200 OK (<200ms ACK)
+### 2. AI Voice Cloning & Hallucination Guardrails
+* **Tone Profile Extraction**: Analyzes 3 to 5 sample emails from a founder via Claude to extract structured voice traits (formality, warmth, directness, sign-off style, and signature phrases).
+* **Stage-Aware Generation**: Dynamically shifts tone from a friendly check-in (`STAGE_1`), to a direct reminder (`STAGE_2`), to a firm final notice (`STAGE_3`).
+* **Strict Output Validation**: `ReminderOutputValidator` verifies that the AI output contains the exact formatted invoice amount, valid JSON structure, and zero fabricated URLs or payment links. If validation fails after retry, the worker automatically falls back to a deterministic template so reminders never stall.
 
-    Note over Queue,Worker: ... 3 Days Pass ...
+### 3. Approval Queue, Pause Controls & Reply Detection
+* **Human-in-the-Loop Approval Mode**: Accounts with `requireApproval: true` hold generated drafts in `PENDING_APPROVAL` status. Founders can list pending drafts, edit subject/body (`PUT /reminders/:id/draft`), approve for immediate dispatch (`POST /reminders/:id/approve`), reject (`POST /reminders/:id/reject`), or skip individual stages (`POST /reminders/:id/skip`).
+* **Configurable Escalation Stages & Send Windows**: Supports custom stage day offsets per account (`settings.stageDays`) and timezone-aware business-hours delivery windows (`sendWindowStart` to `sendWindowEnd` in the account's IANA timezone). Jobs triggered outside business hours are automatically delayed to the next valid window.
+* **Granular Pause / Resume & Inbound Reply Auto-Pause**: Pause or resume reminders per individual invoice (`POST /reminders/invoices/:invoiceId/pause`) or across an entire customer email (`POST /reminders/customers/:email/pause`). Inbound customer replies received at `POST /webhooks/inbound-email` automatically pause all remaining scheduled reminders for that invoice.
 
-    Queue->>Worker: Pick up Reminder Job (Stage 3)
-    Worker->>DB: Check customer suppression list
-    Worker->>Stripe: Live Re-check (fetchLiveInvoice)
-    alt Invoice already PAID or VOID
-        Worker->>DB: Cancel all pending reminders (SKIPPED)
-        Worker-->>Queue: Acknowledge Job (No email sent)
-    else Invoice still OPEN
-        alt Founder Tone Profile Exists
-            Worker->>Claude: Generate reminder in founder tone
-            Claude-->>Worker: Draft with strict placeholders
-            Worker->>Worker: Validate safety (no hallucinations, no invented amounts)
-        else No Tone Profile / Fallback
-            Worker->>Worker: Render standard fallback template
-        end
+### 4. High-Throughput Ingestion & Six-Gate Worker Pipeline
+* **Fast Webhook Ingestion**: Raw-body signature verification, database-backed `WebhookEvent` idempotency, and asynchronous BullMQ scheduling designed for burst invoice storms.
+* **Pre-Send Verification Gates**:
+  1. **Suppression Check**: Drops reminders if the customer is suppressed (`UNSUBSCRIBED`, `BOUNCED`, `COMPLAINED`, or `MANUAL`).
+  2. **Live Stripe Status Check**: Queries Stripe immediately before sending to confirm the invoice is still unpaid; if paid, marks the invoice `PAID` and cancels downstream stages.
+  3. **Business-Hours Send Window**: Re-queues the job if the current time falls outside the account's configured local send window.
+  4. **AI Generation + Validation**: Generates and validates the personalized email draft.
+  5. **Approval & Daily Cap Gate**: Enforces per-account daily send limits (`dailySendCap`) in Redis and respects `requireApproval`.
+  6. **Transactional Dispatch & Audit**: Sends via Resend with `List-Unsubscribe` headers (RFC 8058) and writes an immutable `ReminderAudit` record.
 
-        alt Account is in Approval Mode
-            Worker->>DB: Set status to PENDING_APPROVAL
-        else Normal Mode
-            Worker->>Resend: Send email (Idempotency Key: reminder-send-{id})
-            Resend-->>Customer: Deliver email with 1-Click Unsubscribe
-            Worker->>DB: Update Reminder (status: SENT) & write ReminderAudit
-        end
-    end
-
-    Note over Resend,Ingestion: Customer Bounces or Unsubscribes
-    Resend->>Ingestion: POST /webhooks/resend (email.bounced)
-    Ingestion->>DB: Record Suppression & Cancel remaining reminders
-```
-
----
-
-## Core Features and Technical Highlights
-
-### 1. Robust Stripe Ingestion and Out-of-Order Handling
-- **Idempotency**: All incoming events are recorded in `WebhookEvent` by unique `externalId`. Duplicate events return immediate `200 OK` with zero side effects.
-- **Out-of-Order Guard**: If an `invoice.paid` event arrives *before* an `invoice.finalized` event (common in network races), the invoice is marked `PAID` immediately. Any subsequent late `invoice.finalized` event is prevented from downgrading the invoice back to `OPEN`.
-
-### 2. Live Stripe Verification (Zero False Reminders)
-- Local databases can lag behind payments made via checkout links. Before sending any email, `RemindersProcessor` executes `StripeService.fetchLiveInvoice`.
-- If paid, all remaining scheduled stages (e.g. stage 7, stage 14) are instantly purged and cancelled.
-
-### 3. Claude Tone Engine and Adversarial Safety Validator
-- **Extract Tone Profile**: `POST /tone/profile/rebuild` extracts formality, greetings, sign-offs, humor, warmth, and key phrases from 3-5 sample founder emails.
-- **Safety and Anti-Hallucination Suite**:
-  - Rejects drafts inventing raw numbers, dates, surcharges, or currencies.
-  - Rejects legal threats, suspension warnings, or aggressive debt collection language.
-  - Requires explicit placeholders: `{{amount}}`, `{{due_date}}`, `{{pay_link}}`, `{{sender_name}}`.
-  - Automatic 1-retry with validator feedback; gracefully falls back to deterministic HTML templates upon repeated failure.
-
-### 4. CAN-SPAM / GDPR / RFC 8058 Compliance
-- Every outgoing email includes signed HMAC-SHA256 `List-Unsubscribe` headers and one-click unsubscribe links.
-- Address suppressions (`unsubscribed`, `bounced`, `complained`) cascade across all pending reminders for that account.
-
-### 5. High-Throughput Load Testing and Synthetic Engine
-- Designed for **10,000 invoices** burst scale using k6 (`test/load/webhook-storm.k6.js`) targeting sub-200ms p95 webhook acknowledgement times.
-- Synthetic load test harness (`in_loadtest_*` prefixes or `STRIPE_SECRET_KEY=sk_test_mock`) bypasses external Stripe sandbox rate limits during benchmarks.
-- Invariant verification script (`test/load/verify-invariants.ts`) verifies zero out-of-order status downgrades and zero duplicate reminders.
+### 5. Observability, Health Checks & Dead-Letter Queue (DLQ)
+* **Prometheus Metrics (`/metrics`)**: Tracks `reminders_sent_total`, `reminders_failed_total`, `ai_fallback_used_total`, `webhook_processing_duration_seconds`, and live BullMQ queue depth gauges (`queue_waiting_jobs`, `queue_active_jobs`, `queue_dlq_jobs`).
+* **Readiness Probe (`/health`)**: Powered by `@nestjs/terminus` and `PrismaHealthIndicator` for container orchestration and zero-downtime deployments.
+* **DLQ Inspection & Replay**: Exhausted jobs route to `reminders-dlq` with full failure context and can be inspected (`GET /observability/dlq`) or replayed (`POST /observability/dlq/:jobId/replay`).
+* **Revenue Recovery Funnel**: `/dashboard/overview` and `/dashboard/funnel` track open vs. paid invoices, conversion attribution from sent reminders, and engagement rates (sent, delivered, opened, bounced).
 
 ---
 
 ## Project Structure
 
-```
+```text
 invoice-chaser2/
-├── src/
-│   ├── ai/                      # Claude Tone Engine
-│   │   ├── interfaces/          # ToneProfile & Placeholder definitions
-│   │   ├── prompts/             # System prompts for extraction & generation
-│   │   ├── validators/          # Adversarial safety & hallucination suite
-│   │   ├── ai.module.ts
-│   │   └── ai.service.ts
-│   ├── common/crypto/           # AES-256-GCM encryption & HMAC verification
-│   ├── dashboard/               # Founder KPI endpoints & revenue recovery stats
-│   ├── invoices/                # Invoice synchronization & lifecycle state machine
-│   ├── mail/                    # Resend mailer, Svix webhooks & email templates
-│   ├── observability/           # Prometheus metrics, Alerting & Audit service
-│   ├── prisma/                  # PrismaClient with @prisma/adapter-pg driver
-│   ├── reminders/               # BullMQ worker, delayed scheduling & DLQ management
-│   ├── settings/                # Account configuration & approval mode toggles
-│   ├── stripe/                  # Stripe Connect OAuth & webhook handling
-│   ├── tone/                    # Tone sample storage & preview endpoints
-│   ├── app.module.ts            # Root application module
-│   └── main.ts                  # NestJS bootstrap entrypoint
+├── .github/workflows/
+│   └── ci.yml                       # GitHub Actions CI (Postgres 16, Redis 7, Prisma, TSC, Lint, Jest)
+├── docs/
+│   ├── ALERTING_AND_DASHBOARDS.md   # Prometheus alert rules & Grafana dashboard guide
+│   ├── DATABASE_BACKUP_AND_RESTORE.md # PostgreSQL backup, WAL PITR & disaster recovery runbook
+│   └── KEY_ROTATION.md              # AES-256-GCM encryption key rotation runbook
 ├── prisma/
-│   ├── migrations/              # PostgreSQL schema migrations
-│   └── schema.prisma            # Prisma ORM 7 database schema
+│   ├── schema.prisma                # Multi-tenant schema (Account, Invoice, Reminder, ReminderAudit, etc.)
+│   └── migrations/                  # SQL migrations
+├── src/
+│   ├── ai/                          # Claude integration, prompt builder & output hallucination validator
+│   ├── auth/                        # Magic-link JWT auth, AuthGuard, MetricsGuard & @CurrentUser()
+│   ├── common/                      # AES-256-GCM encryption utility & global exception filters
+│   ├── config/                      # Fail-fast environment variable validation
+│   ├── dashboard/                   # Revenue recovery metrics & delivery funnel endpoints
+│   ├── health/                      # @nestjs/terminus database readiness probe (/health)
+│   ├── mail/                        # Resend email dispatcher, Svix webhook handler & inbound reply auto-pause
+│   ├── observability/               # Prometheus metrics, immutable audit logger, alerts & DLQ replay
+│   ├── prisma/                      # Prisma 7 service with @prisma/adapter-pg connection pool
+│   ├── reminders/                   # BullMQ scheduler, 6-gate worker processor & approval/pause API
+│   ├── settings/                    # Per-account send windows, stage offsets, approval & cap configuration
+│   ├── stripe/                      # Stripe OAuth, webhook signature verification & live invoice fetcher
+│   └── tone/                        # Founder writing sample analysis & tone profile management
 ├── test/
-│   ├── load/
-│   │   ├── webhook-storm.k6.js  # 10k-invoice k6 load test suite
-│   │   └── verify-invariants.ts # Post-test invariant verification script
-│   └── jest-e2e.json            # End-to-end test runner config
-├── docker-compose.yml           # Local PostgreSQL 16 & Redis 7 services
-├── Dockerfile                   # Multi-stage production container build
-├── pnpm-workspace.yaml          # pnpm v11 script authorizations
-├── prisma7.config.ts            # Prisma 7 environment and datasource config
-└── package.json                 # Project scripts and dependencies
+│   └── load/                        # k6 10k-invoice storm script (k6-storm.js) & invariant verifier
+├── Dockerfile                       # Multi-stage Node 22 Alpine production container with HEALTHCHECK
+├── docker-compose.yml               # Local Postgres 16, Redis 7 & API stack
+├── prisma7.config.ts                # Prisma 7 configuration file
+└── .env.example                     # Complete environment variable template
 ```
 
 ---
@@ -211,137 +165,165 @@ invoice-chaser2/
 ## Tech Stack
 
 | Layer | Technology |
-|---|---|
-| **Framework** | NestJS 12 (TypeScript, Express, Fast boot) |
-| **Database** | PostgreSQL 16 via Prisma ORM 7 (`@prisma/adapter-pg`) |
-| **Queues & Scheduling** | BullMQ 6 + Redis 7 (Delayed jobs, DLQ, Concurrency control) |
-| **Payments Ingestion** | Stripe Connect (OAuth 2.0, Webhooks, Live API) |
-| **Email Delivery** | Resend API + Svix Webhook Verification |
-| **AI Tone Engine** | Anthropic Claude SDK (`@anthropic-ai/sdk`) |
-| **Observability** | Prometheus (`prom-client`), Pino logger (`nestjs-pino`) |
-| **Load Testing** | Grafana k6 + Node.js invariant verifier |
-| **Package Manager** | pnpm v11 |
+| :--- | :--- |
+| **Framework** | NestJS 11 (TypeScript 5.9, Node.js 22) |
+| **Database & ORM** | PostgreSQL 16 + Prisma ORM 7 (`@prisma/client` + `@prisma/adapter-pg`) |
+| **Queue & Distributed State** | Redis 7 + BullMQ (`@nestjs/bullmq`, `ioredis`) |
+| **AI Engine** | Anthropic Claude (`@anthropic-ai/sdk`, default `claude-3-5-sonnet-latest`) |
+| **Payments & Webhooks** | Stripe SDK (`stripe` v22) + OAuth 2.0 + Webhook Signing |
+| **Email & Delivery Tracking** | Resend (`resend`) + Svix Webhook Verification (`svix`) |
+| **Security & Auth** | `@nestjs/jwt`, `@nestjs/throttler`, AES-256-GCM (`crypto`) |
+| **Observability & Health** | `prom-client` (Prometheus) + `@nestjs/terminus` (`/health`) |
+| **Testing & Load Verification** | Jest 30, Supertest, Oxlint, k6 (`test/load/k6-storm.js`) |
 
 ---
 
-## Getting Started
+## Quick Start
 
 ### Prerequisites
-- **Node.js**: `v20.19.0` or higher
-- **pnpm**: `v11.x`
-- **Docker & Docker Compose** (for PostgreSQL and Redis) or **DBngin**
+* **Node.js** 22+ and **pnpm** 10+
+* **PostgreSQL** 16+ and **Redis** 7+ (via Docker Compose or local services such as DBngin)
 
-### 1. Clone & Install Dependencies
-```powershell
+### 1. Clone and Install Dependencies
+```bash
 git clone <repository-url>
 cd invoice-chaser2
 pnpm install
 ```
 
 ### 2. Configure Environment Variables
-Copy `.env.example` to `.env` (or configure your existing `.env`):
-```env
-PORT=3000
-APP_URL=http://localhost:3000
-NODE_ENV=development
-
-# Database & Redis
-DATABASE_URL="postgresql://postgres@localhost:5432/invoice_chaser?schema=public"
-REDIS_HOST=localhost
-REDIS_PORT=6379
-
-# Encryption (32-byte / 64 hex characters for AES-256-GCM)
-ENCRYPTION_KEY=d048ce03385db6a1a82324a203bb06009bc7f7ad1b6819f34821f921ea020266
-
-# Stripe Credentials
-STRIPE_SECRET_KEY=sk_test_replace_me
-STRIPE_CLIENT_ID=ca_replace_me
-STRIPE_WEBHOOK_SECRET=whsec_replace_me
-
-# Resend Mail Credentials
-RESEND_API_KEY=re_replace_me
-RESEND_FROM_DOMAIN=onboarding@resend.dev
-RESEND_WEBHOOK_SECRET=whsec_replace_me
-
-# Anthropic Claude API Key
-ANTHROPIC_API_KEY=sk-ant-replace_me
-ANTHROPIC_MODEL=claude-3-5-sonnet-latest
+Copy the example environment file and adjust values as needed:
+```bash
+cp .env.example .env
 ```
 
-> **Mock Mode Tip**: Leaving `ANTHROPIC_API_KEY=sk-ant-mock`, `STRIPE_SECRET_KEY=sk_test_mock`, or `RESEND_API_KEY=re_mock` enables deterministic local mocks for zero-cost testing.
+The default `.env.example` is pre-configured with safe mock credentials (`sk_test_mock`, `re_mock`, `sk-ant-mock`) so you can boot and test the full pipeline locally without paid third-party API keys:
 
-### 3. Spin Up Infrastructure
-```powershell
-docker compose up -d
-```
+| Variable | Description |
+| :--- | :--- |
+| `DATABASE_URL` | PostgreSQL connection string (`postgresql://postgres:postgres@localhost:5432/invoice_chaser?schema=public`) |
+| `REDIS_URL` | Redis connection string (`redis://localhost:6379`) |
+| `JWT_SECRET` | Secret key for signing JWT access and magic-link tokens |
+| `ENCRYPTION_KEY` | 64-character hex string (32 bytes) for AES-256-GCM token encryption |
+| `STRIPE_SECRET_KEY` | Stripe secret key (use `sk_test_mock` for local mock mode) |
+| `STRIPE_WEBHOOK_SECRET` | Stripe webhook signing secret (`whsec_...`) |
+| `RESEND_API_KEY` | Resend API key (use `re_mock` for local mock mode) |
+| `RESEND_WEBHOOK_SECRET` | Svix signing secret for Resend delivery/inbound webhooks |
+| `ANTHROPIC_API_KEY` | Anthropic API key (use `sk-ant-mock` for deterministic local mock mode) |
+| `ANTHROPIC_MODEL` | Claude model identifier (defaults to `claude-3-5-sonnet-latest`) |
+| `METRICS_TOKEN` | Bearer token required to access `/metrics` and `/observability/*` from external networks |
+| `ALERT_WEBHOOK_URL` | Optional Slack/PagerDuty webhook URL for critical DLQ and bounce alerts |
 
-### 4. Run Database Migrations
-```powershell
-pnpm prisma db push
-# or
+### 3. Generate Prisma Client & Run Migrations
+```bash
+pnpm prisma generate
 pnpm prisma migrate dev
 ```
 
-### 5. Start the Application
-```powershell
-# Development mode with hot-reload
+### 4. Start the Application
+```bash
+# Development mode with hot reload
 pnpm start:dev
 
-# Production build
+# Production build and start
 pnpm build
 pnpm start:prod
 ```
 
----
-
-## Testing and Verification
-
-### Unit and Adversarial Tests
-```powershell
-pnpm test
-pnpm test:watch
-```
-
-### 10k Webhook Storm Load Test (k6)
-Run the 10,000 invoice burst ingestion, idempotency replay storm, and out-of-order payment race scenarios:
-```powershell
-k6 run test/load/webhook-storm.k6.js
-```
-
-### Invariant Verification
-Validate zero out-of-order status downgrades and zero invalid reminders after load tests:
-```powershell
-pnpm exec ts-node test/load/verify-invariants.ts
+Or run the entire stack (PostgreSQL 16, Redis 7, and API container) with Docker Compose:
+```bash
+docker compose up --build
 ```
 
 ---
 
-## API and Observability Endpoints
+## API & Operational Endpoints
 
+All tenant-scoped endpoints require an `Authorization: Bearer <jwt>` header obtained from `/auth/verify` and automatically scope queries to the authenticated account.
+
+### Authentication & Health (`@Public()`)
 | Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/webhooks/stripe` | Ingests signed Stripe Connect invoice events |
-| `POST` | `/webhooks/resend` | Handles Svix-verified email delivery, bounce, and complaint events |
-| `GET` | `/connect/stripe` | Initiates OAuth flow to link founder's Stripe account |
-| `GET` | `/connect/stripe/callback` | OAuth redirect handler storing encrypted credentials |
-| `GET` | `/dashboard/stats?accountId=:id` | Overdue vs. recovered revenue & stage breakdown |
-| `GET` | `/metrics` | Prometheus metrics scrape target |
-| `GET` | `/observability/dlq` | Inspect failed jobs routed to the Dead-Letter Queue |
-| `GET` | `/observability/audits?accountId=:id&invoiceId=:id` | Audit trail for every event in an invoice's lifecycle |
-| `PUT` | `/tone/samples` | Saves 3-5 sample emails for tone extraction |
-| `POST` | `/tone/profile/rebuild` | Extracts structured ToneProfile via Claude |
-| `POST` | `/tone/preview` | Generates a preview reminder email |
-| `GET` | `/unsubscribe/:token` | One-click unsubscribe endpoint enforcing suppression |
+| :--- | :--- | :--- |
+| `POST` | `/auth/magic-link` | Request a passwordless login token for an email address |
+| `POST` | `/auth/verify` | Exchange a magic-link token for a session Bearer JWT |
+| `GET` | `/health` | Database readiness probe (`@nestjs/terminus`) |
+
+### Stripe & Email Webhooks (`@Public()`, Signature Verified)
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/stripe/connect` | Initiate Stripe OAuth connection (requires Bearer JWT) |
+| `GET` | `/stripe/oauth/callback` | Complete Stripe OAuth flow and store AES-256-GCM encrypted credentials |
+| `POST` | `/webhooks/stripe` | Ingest signed Stripe invoice events (`invoice.payment_failed`, `invoice.paid`, etc.) |
+| `POST` | `/webhooks/resend` | Ingest Svix-signed Resend delivery events (`delivered`, `opened`, `bounced`, `complained`) |
+| `POST` | `/webhooks/inbound-email` | Ingest inbound customer email replies and auto-pause active invoice reminders |
+| `GET/POST` | `/unsubscribe` | One-click RFC 8058 customer unsubscribe endpoint with HMAC token validation |
+
+### Reminders, Approval Queue & Pause Controls (Bearer JWT Required)
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/reminders` | List reminders for the authenticated account (filterable by `status`) |
+| `GET` | `/reminders/pending` | List drafts waiting in `PENDING_APPROVAL` |
+| `PUT` | `/reminders/:id/draft` | Edit the subject or body of a pending reminder draft |
+| `POST` | `/reminders/:id/approve` | Approve a draft and enqueue it for immediate delivery |
+| `POST` | `/reminders/:id/reject` | Reject and cancel a pending draft |
+| `POST` | `/reminders/:id/skip` | Skip a scheduled reminder stage |
+| `POST` | `/reminders/invoices/:invoiceId/pause` | Pause or resume all reminders for a specific invoice |
+| `POST` | `/reminders/customers/:email/pause` | Suppress or unsuppress reminders for a customer email address |
+
+### Tone Profile, Settings & Analytics (Bearer JWT Required)
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/tone/analyze` | Analyze 3–5 founder sample emails with Claude and save tone profile |
+| `GET` | `/tone` | Retrieve current tone profile for the account |
+| `GET` | `/settings` | Retrieve account escalation stages, send window, timezone, and daily cap |
+| `PUT` | `/settings` | Update account reminder settings |
+| `GET` | `/dashboard/overview` | High-level KPIs (open vs. recovered revenue, active sequences, suppression counts) |
+| `GET` | `/dashboard/funnel` | Stage-by-stage email delivery and conversion funnel |
+
+### Observability & DLQ Management (`MetricsGuard` Protected)
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/metrics` | Prometheus metrics exposition (`text/plain; version=0.0.4`) |
+| `GET` | `/observability/dlq` | Inspect failed jobs sitting in the Dead-Letter Queue (`reminders-dlq`) |
+| `POST` | `/observability/dlq/:jobId/replay` | Replay a dead-lettered job back into the main `reminders` queue |
+| `GET` | `/observability/audit` | Query immutable `ReminderAudit` logs (requires Bearer JWT) |
 
 ---
 
-## Security Best Practices
-- **AES-256-GCM Token Encryption**: Stripe OAuth access tokens are encrypted at rest.
-- **HMAC Signatures**: OAuth state parameters and Unsubscribe tokens are cryptographically signed to defeat CSRF and token tampering.
-- **Webhook Signature Verification**: Strict constant-time HMAC verification on all Stripe (`stripe-signature`) and Resend (`svix-signature`) payloads.
-- **Strict Dep Builds**: Enforces authorized script builds via `pnpm-workspace.yaml`.
+## Testing & Verification
+
+### Unit Tests, Type Check & Linting
+The test suite covers Stripe OAuth/webhook verification, Mail unsubscribe/Svix/suppression cascades, the 6-gate `RemindersProcessor` worker, `AiService` retry/fallback resilience, and `ReminderOutputValidator` hallucination checks:
+
+```bash
+# Run TypeScript compiler verification
+pnpm exec tsc --noEmit
+
+# Run Oxlint static analysis
+pnpm lint
+
+# Run Jest unit test suites
+pnpm test
+```
+
+### Load Testing & Invariant Verification (k6)
+The repository includes a synthetic load generator ([`test/load/k6-storm.js`](test/load/k6-storm.js)) and an automated invariant checker ([`test/load/verify-invariants.ts`](test/load/verify-invariants.ts)) designed to simulate a 10,000-invoice burst (including duplicate deliveries, pre-paid invoices, and suppressed recipients) in mock mode:
+
+```bash
+# 1. Start the server in mock mode (STRIPE_SECRET_KEY=sk_test_mock, RESEND_API_KEY=re_mock, ANTHROPIC_API_KEY=sk-ant-mock)
+pnpm start:dev
+
+# 2. Run the k6 webhook storm
+k6 run test/load/k6-storm.js
+
+# 3. Verify zero duplicate sends, zero paid-invoice sends, and 100% audit trail coverage
+npx ts-node test/load/verify-invariants.ts
+```
 
 ---
 
-## License
-UNLICENSED. Private application.
+## Operational Runbooks
+
+* **Encryption Key Rotation**: [`docs/KEY_ROTATION.md`](docs/KEY_ROTATION.md) — Step-by-step guide for rotating `ENCRYPTION_KEY` without downtime.
+* **Database Backups & PITR Restore**: [`docs/DATABASE_BACKUP_AND_RESTORE.md`](docs/DATABASE_BACKUP_AND_RESTORE.md) — Daily `pg_dump` automation, WAL Point-in-Time Recovery, and quarterly restore drills.
+* **Alerting & Grafana Dashboards**: [`docs/ALERTING_AND_DASHBOARDS.md`](docs/ALERTING_AND_DASHBOARDS.md) — Prometheus alert rules and Grafana panel queries for queue depth, DLQ spikes, and AI fallbacks.

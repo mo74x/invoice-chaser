@@ -43,7 +43,7 @@ export class AiService {
     this.anthropic = this.isMockMode ? null : new Anthropic({ apiKey });
     this.model = this.configService.get<string>(
       'ANTHROPIC_MODEL',
-      'claude-sonnet-4-20250514',
+      'claude-3-5-sonnet-latest',
     );
   }
 
