@@ -36,9 +36,64 @@ export class RemindersService {
     });
   }
 
-  async approveAndSend(reminderId: string) {
-    const reminder = await this.prisma.reminder.findUnique({
+  async editDraft(
+    reminderId: string,
+    accountId: string,
+    updates: { subject?: string; body: string },
+  ) {
+    const reminder = await this.prisma.reminder.findFirst({
+      where: { id: reminderId, invoice: { accountId } },
+    });
+
+    if (!reminder) {
+      throw new NotFoundException(`Reminder ${reminderId} not found`);
+    }
+
+    if (reminder.status !== ReminderStatus.PENDING_APPROVAL) {
+      throw new BadRequestException('Only reminders in PENDING_APPROVAL status can be edited');
+    }
+
+    return this.prisma.reminder.update({
       where: { id: reminderId },
+      data: {
+        ...(updates.subject !== undefined ? { subject: updates.subject } : {}),
+        body: updates.body,
+      },
+    });
+  }
+
+  async rejectReminder(
+    reminderId: string,
+    accountId: string,
+    reason = 'Rejected by founder',
+  ) {
+    const reminder = await this.prisma.reminder.findFirst({
+      where: { id: reminderId, invoice: { accountId } },
+    });
+
+    if (!reminder) {
+      throw new NotFoundException(`Reminder ${reminderId} not found`);
+    }
+
+    if (reminder.status !== ReminderStatus.PENDING_APPROVAL) {
+      throw new BadRequestException('Only reminders in PENDING_APPROVAL status can be rejected');
+    }
+
+    return this.prisma.reminder.update({
+      where: { id: reminderId },
+      data: {
+        status: ReminderStatus.SKIPPED,
+        failureReason: reason,
+      },
+    });
+  }
+
+  async approveAndSend(reminderId: string, accountId?: string) {
+    const reminder = await this.prisma.reminder.findFirst({
+      where: {
+        id: reminderId,
+        ...(accountId ? { invoice: { accountId } } : {}),
+      },
       include: {
         invoice: {
           include: { account: true },
@@ -114,9 +169,12 @@ export class RemindersService {
     return { sent: true, reminder: updated };
   }
 
-  async skipReminder(reminderId: string) {
-    const reminder = await this.prisma.reminder.findUnique({
-      where: { id: reminderId },
+  async skipReminder(reminderId: string, accountId?: string) {
+    const reminder = await this.prisma.reminder.findFirst({
+      where: {
+        id: reminderId,
+        ...(accountId ? { invoice: { accountId } } : {}),
+      },
     });
 
     if (!reminder) {
@@ -134,5 +192,27 @@ export class RemindersService {
         failureReason: 'Manually skipped by founder',
       },
     });
+  }
+
+  async pauseInvoice(invoiceId: string, accountId: string) {
+    const invoice = await this.prisma.invoice.findFirst({
+      where: { id: invoiceId, accountId },
+    });
+
+    if (!invoice) {
+      throw new NotFoundException(`Invoice ${invoiceId} not found`);
+    }
+
+    await this.schedulerService.cancelForInvoice(invoiceId, 'Paused by founder');
+    return { paused: true, invoiceId };
+  }
+
+  async pauseCustomer(customerEmail: string, accountId: string) {
+    await this.mailService.suppressAddressAndCancelReminders(
+      accountId,
+      customerEmail,
+      'unsubscribed',
+    );
+    return { paused: true, customerEmail };
   }
 }

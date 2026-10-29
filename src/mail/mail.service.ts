@@ -382,4 +382,44 @@ export class MailService {
 
     return { processed: true };
   }
+
+  async handleInboundReply(fromEmail: string, _toEmail?: string) {
+    const normalizedFrom = fromEmail.toLowerCase().trim();
+
+    // Find accounts that have invoices with this customerEmail
+    const invoices = await this.prisma.invoice.findMany({
+      where: {
+        customerEmail: normalizedFrom,
+        status: 'OPEN',
+      },
+      select: {
+        id: true,
+        accountId: true,
+      },
+    });
+
+    if (invoices.length === 0) {
+      this.logger.debug(`Inbound reply from ${normalizedFrom} matched zero open invoices`);
+      return { paused: 0 };
+    }
+
+    let pausedCount = 0;
+    for (const inv of invoices) {
+      await this.prisma.reminder.updateMany({
+        where: {
+          invoiceId: inv.id,
+          status: { in: [ReminderStatus.SCHEDULED, ReminderStatus.PENDING_APPROVAL] },
+        },
+        data: {
+          status: ReminderStatus.SKIPPED,
+          failureReason: 'Customer replied to email (sequence auto-paused)',
+        },
+      });
+      pausedCount++;
+    }
+
+    this.logger.log(`Auto-paused reminders across ${pausedCount} invoice(s) due to reply from ${normalizedFrom}`);
+    return { paused: pausedCount, from: normalizedFrom };
+  }
+
 }

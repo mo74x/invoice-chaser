@@ -4,6 +4,7 @@ import { Request } from 'express';
 import { MailService } from './mail.service';
 import { MetricsService } from '../observability/metrics.service';
 import { Public } from '../auth/public.decorator';
+import { InboundEmailWebhookDto } from './dto/inbound-email.dto';
 
 @common.Controller()
 export class MailController {
@@ -41,6 +42,14 @@ export class MailController {
     stopTimer({ event_type: payload.type, status: '200' });
 
     return result;
+  }
+
+  @Public()
+  @Throttle({ default: { limit: 60, ttl: 60000 } })
+  @common.Post('webhooks/inbound-email')
+  @common.HttpCode(common.HttpStatus.OK)
+  async handleInboundReply(@common.Body() dto: InboundEmailWebhookDto) {
+    return this.mailService.handleInboundReply(dto.from, dto.to);
   }
 
   @Public()
