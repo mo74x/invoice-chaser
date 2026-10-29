@@ -162,8 +162,7 @@ sequenceDiagram
 - Address suppressions (`unsubscribed`, `bounced`, `complained`) cascade across all pending reminders for that account.
 
 ### 5. High-Throughput Load Testing and Synthetic Engine
-- Tested under **10,000 invoices** using k6 (`test/load/webhook-storm.k6.js`).
-- Sub-200ms p95 webhook acknowledgement times.
+- Designed for **10,000 invoices** burst scale using k6 (`test/load/webhook-storm.k6.js`) targeting sub-200ms p95 webhook acknowledgement times.
 - Synthetic load test harness (`in_loadtest_*` prefixes or `STRIPE_SECRET_KEY=sk_test_mock`) bypasses external Stripe sandbox rate limits during benchmarks.
 - Invariant verification script (`test/load/verify-invariants.ts`) verifies zero out-of-order status downgrades and zero duplicate reminders.
 
