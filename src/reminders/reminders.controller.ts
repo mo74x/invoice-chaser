@@ -3,21 +3,18 @@ import {
   Get,
   Post,
   Param,
-  Query,
-  BadRequestException,
 } from '@nestjs/common';
 import { RemindersService } from './reminders.service';
+import { CurrentUser } from '../auth/current-user.decorator';
+import type { AuthenticatedUser } from '../auth/current-user.decorator';
 
 @Controller('reminders')
 export class RemindersController {
   constructor(private readonly remindersService: RemindersService) {}
 
   @Get('pending')
-  async getPending(@Query('accountId') accountId: string) {
-    if (!accountId) {
-      throw new BadRequestException('accountId query parameter is required');
-    }
-    return this.remindersService.listPending(accountId);
+  async getPending(@CurrentUser() user: AuthenticatedUser) {
+    return this.remindersService.listPending(user.accountId);
   }
 
   @Post(':id/approve')

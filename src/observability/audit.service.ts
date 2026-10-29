@@ -25,7 +25,7 @@ export class AuditService {
         reminderId: params.reminderId,
         stage: params.stage,
         auditEvent: params.event,
-        ...(params.metadata ?? {}),
+        ...params.metadata,
       },
       `Reminder audit: ${params.event} (invoice=${params.invoiceId}, stage=${params.stage})`,
     );

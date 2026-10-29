@@ -1,9 +1,13 @@
 import { Module } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { BullModule } from '@nestjs/bullmq';
+import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { LoggerModule } from 'nestjs-pino';
 import { PrismaModule } from './prisma/prisma.module';
 import { CryptoModule } from './common/crypto/crypto.module';
+import { AuthModule } from './auth/auth.module';
+import { AuthGuard } from './auth/auth.guard';
 import { ObservabilityModule } from './observability/observability.module';
 import { InvoicesModule } from './invoices/invoices.module';
 import { StripeModule } from './stripe/stripe.module';
@@ -25,6 +29,12 @@ import { DashboardModule } from './dashboard/dashboard.module';
             : undefined,
       },
     }),
+    ThrottlerModule.forRoot([
+      {
+        ttl: 60000,
+        limit: 100,
+      },
+    ]),
     BullModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
@@ -36,6 +46,7 @@ import { DashboardModule } from './dashboard/dashboard.module';
     }),
     PrismaModule,
     CryptoModule,
+    AuthModule,
     InvoicesModule,
     StripeModule,
     MailModule,
@@ -45,6 +56,16 @@ import { DashboardModule } from './dashboard/dashboard.module';
     ObservabilityModule,
     SettingsModule,
     DashboardModule,
+  ],
+  providers: [
+    {
+      provide: APP_GUARD,
+      useClass: AuthGuard,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,
+    },
   ],
 })
 export class AppModule {}

@@ -4,6 +4,7 @@ import {
   Query,
   Res,
   BadRequestException,
+  UseGuards,
 } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -11,8 +12,12 @@ import type { Response } from 'express';
 import { MetricsService } from './metrics.service';
 import { AuditService } from './audit.service';
 import { REMINDERS_DLQ_QUEUE } from '../reminders/reminders.constants';
+import { MetricsGuard } from '../auth/metrics.guard';
+import { CurrentUser } from '../auth/current-user.decorator';
+import type { AuthenticatedUser } from '../auth/current-user.decorator';
 
 @Controller()
+@UseGuards(MetricsGuard)
 export class ObservabilityController {
   constructor(
     private readonly metricsService: MetricsService,
@@ -40,14 +45,12 @@ export class ObservabilityController {
 
   @Get('observability/audits')
   async getInvoiceAudits(
-    @Query('accountId') accountId: string,
+    @CurrentUser() user: AuthenticatedUser,
     @Query('invoiceId') invoiceId: string,
   ) {
-    if (!accountId || !invoiceId) {
-      throw new BadRequestException(
-        'accountId and invoiceId query parameters are required',
-      );
+    if (!invoiceId) {
+      throw new BadRequestException('invoiceId query parameter is required');
     }
-    return this.auditService.getAuditTrailForInvoice(accountId, invoiceId);
+    return this.auditService.getAuditTrailForInvoice(user.accountId, invoiceId);
   }
 }

@@ -57,30 +57,30 @@ flowchart TD
     end
 
     %% Flow connections
-    Stripe -->|Raw Payload + Stripe-Sig| StripeCtrl
-    Resend -->|Raw Payload + Svix Headers| ResendCtrl
-    K6 -->|Burst Webhooks (10k scale)| StripeCtrl
+    Stripe -->|"Raw Payload + Stripe-Sig"| StripeCtrl
+    Resend -->|"Raw Payload + Svix Headers"| ResendCtrl
+    K6 -->|"Burst Webhooks (10k scale)"| StripeCtrl
 
     StripeCtrl --> Crypto
     ResendCtrl --> Crypto
-    StripeCtrl -->|Idempotent Upsert| Prisma
-    StripeCtrl -->|Schedule 3d, 7d, 14d| BullQueue
+    StripeCtrl -->|"Idempotent Upsert"| Prisma
+    StripeCtrl -->|"Schedule 3d, 7d, 14d"| BullQueue
 
     BullQueue --> Redis
     Redis --> Worker
     Worker --> LiveCheck
-    LiveCheck -->|Verify not PAID/VOID| Stripe
-    Worker -->|If Tone Profile configured| AiEngine
-    AiEngine -->|Extract & Generate| Claude
-    AiEngine -.->|On Validation Error| Fallback
-    Worker -->|Send Email| MailService
+    LiveCheck -->|"Verify not PAID/VOID"| Stripe
+    Worker -->|"If Tone Profile configured"| AiEngine
+    AiEngine -->|"Extract & Generate"| Claude
+    AiEngine -.->|"On Validation Error"| Fallback
+    Worker -->|"Send Email"| MailService
     MailService --> Resend
-    Worker -->|Max Retries Exhausted| DLQueue
+    Worker -->|"Max Retries Exhausted"| DLQueue
     DLQueue --> Alerts
 
     Worker --> Audits
-    ResendCtrl -->|Update DeliveryStatus & Suppressions| Prisma
-    Metrics -->|Gauges & Histograms| Worker
+    ResendCtrl -->|"Update DeliveryStatus & Suppressions"| Prisma
+    Metrics -->|"Gauges & Histograms"| Worker
     Dashboard --> Prisma
     Prisma --> Postgres
 ```

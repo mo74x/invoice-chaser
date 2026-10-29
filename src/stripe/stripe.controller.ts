@@ -10,6 +10,9 @@ import {
   STRIPE_EVENTS_QUEUE,
   SUPPORTED_STRIPE_EVENTS,
 } from './stripe.constants';
+import { CurrentUser } from '../auth/current-user.decorator';
+import type { AuthenticatedUser } from '../auth/current-user.decorator';
+import { Public } from '../auth/public.decorator';
 
 @common.Controller()
 export class StripeController {
@@ -24,14 +27,12 @@ export class StripeController {
   ) {}
 
   @common.Get('connect/stripe')
-  startOAuth(@common.Query('accountId') accountId: string) {
-    if (!accountId) {
-      throw new common.BadRequestException('accountId query parameter is required');
-    }
-    const url = this.stripeService.generateOAuthUrl(accountId);
+  startOAuth(@CurrentUser() user: AuthenticatedUser) {
+    const url = this.stripeService.generateOAuthUrl(user.accountId);
     return { url };
   }
 
+  @Public()
   @common.Get('connect/stripe/callback')
   async finishOAuth(
     @common.Query('code') code: string,
@@ -43,6 +44,7 @@ export class StripeController {
     return this.stripeService.handleOAuthCallback(code, state);
   }
 
+  @Public()
   @common.Post('webhooks/stripe')
   @common.HttpCode(common.HttpStatus.OK)
   async handleStripeWebhook(

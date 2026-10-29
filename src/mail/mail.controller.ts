@@ -1,7 +1,9 @@
 import * as common from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { Request } from 'express';
 import { MailService } from './mail.service';
 import { MetricsService } from '../observability/metrics.service';
+import { Public } from '../auth/public.decorator';
 
 @common.Controller()
 export class MailController {
@@ -10,6 +12,7 @@ export class MailController {
     private readonly metricsService: MetricsService,
   ) {}
 
+  @Public()
   @common.Post('webhooks/resend')
   @common.HttpCode(common.HttpStatus.OK)
   async handleResendWebhook(
@@ -40,6 +43,8 @@ export class MailController {
     return result;
   }
 
+  @Public()
+  @Throttle({ default: { limit: 20, ttl: 60000 } })
   @common.Get('unsubscribe/:token')
   @common.Header('Content-Type', 'text/html; charset=utf-8')
   async unsubscribePage(@common.Param('token') token: string): Promise<string> {
@@ -66,6 +71,8 @@ export class MailController {
 </html>`.trim();
   }
 
+  @Public()
+  @Throttle({ default: { limit: 20, ttl: 60000 } })
   @common.Post('unsubscribe/:token')
   @common.HttpCode(common.HttpStatus.OK)
   async unsubscribeOneClick(@common.Param('token') token: string) {
